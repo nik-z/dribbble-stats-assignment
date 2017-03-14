@@ -11,8 +11,12 @@
 (def auth-header {:Authorization (str "Bearer " client-token)})
 (def api-prefix "https://api.dribbble.com/v1")
 
-;Queues
-(defprotocol AQueue
+
+;; Queues and related 
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Queues
+(defprotocol Queue
   (put! [this, e])
   (take! [this])
   (close! [this])
@@ -22,11 +26,98 @@
     (doseq [e elements] (put! queue e) ))
 
 (deftype AsyncQueue [c]
-    AQueue
+    Queue
   (put! [this, e] (async/>!! c e) )
   (take! [this]  (async/<!! c) )
   (close! [this]  (async/close! c) )
 )
+
+
+;; Producers
+(defprotocol Producer
+  (take! [this])
+  (closed? [this])
+)
+
+(deftype StatefulProducer [state-ref fn]
+    Producer
+    (take! [this] 
+        (let [state (deref state)]
+            (if (nil? next-state)
+                nil
+                (let [result (fn state)]
+                    (reset! state-ref (:next-state result))
+                    (:data result)
+                )
+            )
+        )
+    )
+    (closed? (nil? (deref state)) )
+)
+
+(defn ->StatefulProducer [initial-state fn] (StatefulProducer. (atom initial-state) fn) )
+
+
+;; Pipelines
+(defn pipeline-exec [fn e dst]
+    (let [results (fn e)]
+        (doseq [result results)]
+            (put! dst result) 
+    )
+)
+
+(defn pipeline-close [destination]
+    (close! destination) 
+    destination
+)
+
+(defn pipeline-loop  [source nonil-fn nil-fn]
+    (loop [e (take! source)]
+        (if (nil? e)
+            (nil-fn)
+            (let [results (fn e)]
+                (nonil-fn e) 
+                (recur (take! source))
+            )
+        )
+    )
+)
+
+(defn pipeline [source destination fn]
+    (pipeline-loop source
+        #(pipeline-exec fn %) 
+        #(pipeline-close destination)
+    )
+)
+
+(defn seq-producer-pipeline [source destination producer-factory fn]
+    (loop [p (take! source)]
+        (if (nil? p)
+            (pipeline-close destination)
+            (pipeline-loop (producer-factory p fn)
+                #(pipeline-exec fn %) 
+                (fn [] nil)
+            )
+        )
+    )
+)
+
+;; (defn sink [queue-from fn initial-value combine-fn] 
+;;     (loop [e (take! queue-from) return initial-value]
+;;         (let [results (fn e)]
+;;             (doseq [result results]
+;;                 (put! queue-to result) )
+;;         )
+;;         (recur (take! queue-from) (combine return)
+;;     )
+;; )
+
+;; (defn create-queue [limiter]
+;;     (ThrottledQueue. (AsyncQueue. (async/chan 10000)) limiter) )
+
+
+;; Operations throughput throttling
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defprotocol ALimiter
   (acquire! 
@@ -90,47 +181,8 @@
     (reset! limiter-refresh-control true) )
 
 
-;; (deftype ThrottledQueue [q, limiter]
-;;     AQueue
-;;   (put! [this, e] (put! q e) )
-;;   (take! [this]  
-;;     (acquire! limiter)
-;;     (take! q) )
-;; )
 
-(defn source [queue-to fn] (put! queue-to (fn)) )
-
-(defn pipeline [queue-from queue-to fn]
-    (loop [e (take! queue-from)]
-        (let [results (fn e)]
-;;            (println "passdown: " (:passdown results))
-            (doseq [result (:passdown results)]
-                (put! queue-to result) )
-;;            (println "loopback: " (:loopback results))
-            (doseq [e (:loopback results)]
-                (put! queue-from e) )
-            (if (:close results)
-                (close! queue-from)
-        )
-        (recur (take! queue-from))
-    )
-)
-
-;; (defn sink [queue-from fn initial-value combine-fn] 
-;;     (loop [e (take! queue-from) return initial-value]
-;;         (let [results (fn e)]
-;;             (doseq [result results]
-;;                 (put! queue-to result) )
-;;         )
-;;         (recur (take! queue-from) (combine return)
-;;     )
-;; )
-
-;; (defn create-queue [limiter]
-;;     (ThrottledQueue. (AsyncQueue. (async/chan 10000)) limiter) )
-
-  
-; Dribbble API
+;; Dribbble API
 ;;;;;;;;;;;;;;;;;;;;
 
 (def api-limiter (->SemaphoreLimiter 60))
@@ -190,11 +242,10 @@
 )
 
 
-(defn api-pipeline-step [fn close?]
+(defn api-pipeline-step [fn]
     #(let [results (fn %)]
-        {:passdown (:data results)
-        :loopback (if (:next-page-url results) [(:next-page-url results)] [])
-        :close (close? results)}
+        {:data (:data results)
+        :next-state (:next-page-url results)
     )
 )
 
@@ -211,15 +262,6 @@
 (defn map-likes [json]
     (println (map #(get % "likes_url") json ))
     (map #(get-in % ["user" "name"]) json )
-)
-
-(defn user-to-followers [queue-from queue-to] 
-    (pipeline queue-from queue-to 
-        (api-pipeline-step 
-            #(api-get-list % map-followers)
-            #(= (:next-page-url results) nil)
-        )
-    )
 )
 
 ;; (defn api-get [resource] 
@@ -254,26 +296,49 @@
   (let [
         limiter-refresh-control (api-start)
     ]
-    (def q1 (AsyncQueue. (async/chan 10000)) )
-    (def q2 (AsyncQueue. (async/chan 10000)) )
-    (def q3 (AsyncQueue. (async/chan 10000)) )
     
-    (put! q1 (api-path "/users/simplebits/followers"))
+    (def followers-producer 
+        (->StatefulProducer 
+            (api-path "/users/simplebits/followers")  
+            (api-pipeline-step #(api-get % map-followers))
+        )
+    )
+    (def q-followers (AsyncQueue. (async/chan 10000)) )
+    (def q-shots (AsyncQueue. (async/chan 10000)) )
+    (def q-likes (AsyncQueue. (async/chan 10000)) )
+
     
+    (loop [a 1] (println (take! followers-producer)) (recur 1)) 
+
+    
+;;     (future (pipeline followers-producer q-followers 
+;;         #(identity %)
+;;     ) )
+
+    
+    
+;;     (future (seq-producer-pipeline q-followers  q-shots
+;;         (fn [p fn] 
+;;             (->StatefulProducer p (api-pipeline-step #(api-get % map-shots)) )
+;;         )
+;;         #(identity %)
+;;     ) )
+;; 
+;;     (future (seq-producer-pipeline q-shots q-likes
+;;         (fn [p fn] 
+;;             (->StatefulProducer p (api-pipeline-step #(api-get % map-likes)) )
+;;         )
+;;         #(identity %)
+;;     ) )
+
+
 ;;     (pipeline q1 q2
 ;;         #(api-get %)
 ;;     )
-    (future (user-to-followers q1 q2))
+;;    (future (user-to-followers q1 q2))
 
     
-    (future (pipeline q2 q3 
-        (api-pipeline-step 
-            #(api-get % map-shots)
-            #(= (:next-page-url results) nil)
-        )
-    ) )
     
-    (loop [a 1] (println (take! q3)) (recur 1)) 
     
 ;    (dotimes [i 180] (put! q1 (str "test" i)))
 ;    (put! q1 "simplebits")
@@ -281,7 +346,7 @@
 ;    (future (pipeline q1 q2 #(do (println "pipeline1: " %) [(str "after ppl1" %)])))
 ;    (println "----")
 ;    (dotimes [i 180] (println (take! q2)))
-    (println (take! q2))
+;    (println (take! q2))
     
     ;(println (api-get-list (api-path "/users/simplebits/followers")))
     
