@@ -35,15 +35,15 @@
 
 ;; Producers
 (defprotocol Producer
-  (take! [this])
+  (get! [this])
   (closed? [this])
 )
 
 (deftype StatefulProducer [state-ref fn]
     Producer
-    (take! [this] 
-        (let [state (deref state)]
-            (if (nil? next-state)
+    (get! [this] 
+        (let [state (deref state-ref)]
+            (if (nil? state)
                 nil
                 (let [result (fn state)]
                     (reset! state-ref (:next-state result))
@@ -52,17 +52,17 @@
             )
         )
     )
-    (closed? (nil? (deref state)) )
+    (closed? [this] (nil? (deref state-ref)) )
 )
 
-(defn ->StatefulProducer [initial-state fn] (StatefulProducer. (atom initial-state) fn) )
+(defn stateful-producer [initial-state fn] (StatefulProducer. (atom initial-state) fn) )
 
 
 ;; Pipelines
 (defn pipeline-exec [fn e dst]
     (let [results (fn e)]
-        (doseq [result results)]
-            (put! dst result) 
+        (doseq [result results]
+            (put! dst result)) 
     )
 )
 
@@ -71,21 +71,21 @@
     destination
 )
 
-(defn pipeline-loop  [source nonil-fn nil-fn]
-    (loop [e (take! source)]
+(defn pipeline-loop  [src-fn nonil-fn nil-fn]
+    (loop [e (src-fn)]
         (if (nil? e)
             (nil-fn)
-            (let [results (fn e)]
+            (do
                 (nonil-fn e) 
-                (recur (take! source))
+                (recur (src-fn))
             )
         )
     )
 )
 
-(defn pipeline [source destination fn]
-    (pipeline-loop source
-        #(pipeline-exec fn %) 
+(defn pipeline [src-fn destination fn]
+    (pipeline-loop src-fn
+        #(pipeline-exec fn % destination) 
         #(pipeline-close destination)
     )
 )
@@ -94,10 +94,13 @@
     (loop [p (take! source)]
         (if (nil? p)
             (pipeline-close destination)
-            (pipeline-loop (producer-factory p fn)
-                #(pipeline-exec fn %) 
-                (fn [] nil)
-            )
+            (let [producer (producer-factory p)]
+                (pipeline-loop #(get! producer)
+                    #(pipeline-exec fn % destination) 
+                    #(print destination)
+                )
+                (recur (take! source))
+            ) 
         )
     )
 )
@@ -138,7 +141,7 @@
   )
 )
 
-(defn ->SemaphoreLimiter [max]
+(defn semaphore-limiter [max]
     (let [semaphore (java.util.concurrent.Semaphore. max)]
         (SemaphoreLimiter. max semaphore)
     )
@@ -185,22 +188,24 @@
 ;; Dribbble API
 ;;;;;;;;;;;;;;;;;;;;
 
-(def api-limiter (->SemaphoreLimiter 60))
+(def api-limiter (semaphore-limiter 60))
 
-(defn api-path [resource] (str api-prefix resource))
+(defn api-path [resource] (str api-prefix resource "?per_page=100"))
 
-(defn api-get-http [path]
-    (acquire! api-limiter)
-    
-    (let [ res
-    (client/get path {:headers auth-header})
-    ] 
-    (println "X-RateLimit-Reset: " (get-in res [:headers "X-RateLimit-Reset"])) 
-    (println "X-RateLimit-Remaining: " (get-in res [:headers "X-RateLimit-Remaining"])) 
-    (if (= "0" (get-in res [:headers "X-RateLimit-Remaining"]))
-        (acquire-all! api-limiter)
+(defn api-get-http 
+    ([path reader-fn limiter]
+        (acquire! limiter)
+        
+        (let [res  (reader-fn path {:headers auth-header}) ] 
+            (println "X-RateLimit-Reset: " (get-in res [:headers "X-RateLimit-Reset"])) 
+            (println "X-RateLimit-Remaining: " (get-in res [:headers "X-RateLimit-Remaining"])) 
+            (if (= "0" (get-in res [:headers "X-RateLimit-Remaining"]))
+                (acquire-all! limiter)
+            )
+            res
+        )
     )
-    res)
+    ([path] (api-get-http path client/get api-limiter))
 )
 
 (defn api-parse-response [response] 
@@ -211,28 +216,13 @@
 )
 
 (defn api-get 
-    ([path mapper] 
-        (let [result (api-parse-response (api-get-http path))] 
+    ([path mapper reader-fn limiter] 
+        (let [result (api-parse-response (api-get-http path reader-fn limiter))] 
             (assoc result :data  (mapper (:data result)) )
         )
     )
+    ([path mapper]  (api-get path mapper client/get api-limiter) )
     ([path] (api-get path #(identity %) ) )
-)
-
-(defn api-get-list 
-    ([path mapper] 
-        (loop [p path result []] 
-            (println "path: " p)
-            (if (= p nil) 
-                result
-                (let [res (api-get p mapper)]
-                    ;(println "result: \n" res)
-                    (recur (:next-page-url res) (conj result (:data res)))
-                )
-            )
-        )
-    )
-    ([path] (api-get-list path #(identity %) ) )
 )
 
 (defn api-start []
@@ -245,23 +235,23 @@
 (defn api-pipeline-step [fn]
     #(let [results (fn %)]
         {:data (:data results)
-        :next-state (:next-page-url results)
+        :next-state (:next-page-url results) }
     )
 )
 
 (defn map-followers [json]
-    (println (map #(get-in % ["follower" "shots_url"]) json ))
+;;    (println (map #(get-in % ["follower" "shots_url"]) json ))
     (map #(get-in % ["follower" "shots_url"]) json )
 )
 
 (defn map-shots [json]
-    (println (map #(get % "likes_url") json ))
+;;    (println (map #(get % "likes_url") json ))
     (map #(get % "likes_url") json )
 )
 
 (defn map-likes [json]
-    (println (map #(get % "likes_url") json ))
-    (map #(get-in % ["user" "name"]) json )
+    (println (map #(get-in % ["user" "username"]) json ))
+    (map #(get-in % ["user" "username"]) json )
 )
 
 ;; (defn api-get [resource] 
@@ -298,8 +288,8 @@
     ]
     
     (def followers-producer 
-        (->StatefulProducer 
-            (api-path "/users/simplebits/followers")  
+        (stateful-producer 
+            (api-path "/users/an-nguyen/followers")  
             (api-pipeline-step #(api-get % map-followers))
         )
     )
@@ -308,48 +298,48 @@
     (def q-likes (AsyncQueue. (async/chan 10000)) )
 
     
-    (loop [a 1] (println (take! followers-producer)) (recur 1)) 
 
     
-;;     (future (pipeline followers-producer q-followers 
-;;         #(identity %)
-;;     ) )
+     (future (pipeline #(get! followers-producer) q-followers 
+         #(identity %)
+     ) )
+    
+    (future (seq-producer-pipeline q-followers  q-shots
+        (fn [p] 
+            (stateful-producer p (api-pipeline-step #(api-get % map-shots)) )
+        )
+        #(identity %)
+    ) )
 
-    
-    
-;;     (future (seq-producer-pipeline q-followers  q-shots
-;;         (fn [p fn] 
-;;             (->StatefulProducer p (api-pipeline-step #(api-get % map-shots)) )
-;;         )
-;;         #(identity %)
-;;     ) )
-;; 
-;;     (future (seq-producer-pipeline q-shots q-likes
-;;         (fn [p fn] 
-;;             (->StatefulProducer p (api-pipeline-step #(api-get % map-likes)) )
-;;         )
-;;         #(identity %)
-;;     ) )
+    (future (seq-producer-pipeline q-shots q-likes
+        (fn [p] 
+            (stateful-producer p (api-pipeline-step #(api-get % map-likes)) )
+        )
+        #(identity %)
+    ) )
 
+            
+    (def results (loop [u (take! q-likes) results (hash-map)] 
+        (println "collect: " u) 
+        (if (nil? u)
+            results
+            (recur 
+                (take! q-likes)
+                (if (nil? (get results u))
+                    (assoc results u 1)
+                    (update results u #(inc %))
+                )
+            )
+        )
+    ) )
+    
+    (println 
+        (into (sorted-map-by (fn [key1 key2]
+                        (compare [(get results key2) key2]
+                                [(get results key1) key1])))
+        results)
+    )
 
-;;     (pipeline q1 q2
-;;         #(api-get %)
-;;     )
-;;    (future (user-to-followers q1 q2))
-
-    
-    
-    
-;    (dotimes [i 180] (put! q1 (str "test" i)))
-;    (put! q1 "simplebits")
-;;    (future (pipeline q1 q2 #(user-followers %)))
-;    (future (pipeline q1 q2 #(do (println "pipeline1: " %) [(str "after ppl1" %)])))
-;    (println "----")
-;    (dotimes [i 180] (println (take! q2)))
-;    (println (take! q2))
-    
-    ;(println (api-get-list (api-path "/users/simplebits/followers")))
-    
     (stop-refresh-limiter limiter-refresh-control)
     (shutdown-agents)
   )
