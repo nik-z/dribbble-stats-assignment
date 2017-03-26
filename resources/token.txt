@@ -1,3 +1,3 @@
-{:client-id "insert client id here"
- :client-token "insert client tocken here"
+{:client-id "<insert app ID>"
+ :client-token "<insert token>"
 }
