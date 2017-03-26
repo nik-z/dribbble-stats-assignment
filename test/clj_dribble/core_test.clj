@@ -79,7 +79,7 @@
             (let [producer 
                 (stateful-producer 
                     (api-path "/users/test0/followers")  
-                    (api-pipeline-step #(api-get % map-followers))
+                    (api-producer-step #(api-get % map-followers))
                 )]
                 
                 (is (= 
@@ -111,7 +111,7 @@
                 
                 (let [producer
                   (stateful-multi-producer #(take! q1) 
-                    (fn [p] (stateful-producer p (api-pipeline-step #(api-get % map-shots)) ) ) 
+                    (fn [p] (stateful-producer p (api-producer-step #(api-get % map-shots)) ) ) 
                   )
                 ]
                 
