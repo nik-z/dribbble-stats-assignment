@@ -125,7 +125,7 @@
     (def followers-producer 
         (stateful-producer 
             (api-path (str "/users/" (first args) "/followers"))  
-            (api-pipeline-step #(api-get % map-followers))
+            (api-producer-step #(api-get % map-followers))
         )
     )
     ;; Followers queue
@@ -141,7 +141,7 @@
     ;; Get all shots of a user
     ;; Reads URLs to shots from a queue
     (def shots-producer (stateful-multi-producer #(take! q-followers) 
-        (fn [p] (stateful-producer p (api-pipeline-step #(api-get % map-shots)) ) ) 
+        (fn [p] (stateful-producer p (api-producer-step #(api-get % map-shots)) ) ) 
         ))
     ;; Pileline from shots producer to followers queue
     (future (pipeline #(get! shots-producer) #(put! q-shots %) #(close! q-shots) ) )
@@ -149,7 +149,7 @@
     ;; Get all likes for shot
     ;; Reads URLs to likes from a queue
     (def likes-producer (stateful-multi-producer #(take! q-shots) 
-        (fn [p] (stateful-producer p (api-pipeline-step #(api-get % map-likes)) ) )
+        (fn [p] (stateful-producer p (api-producer-step #(api-get % map-likes)) ) )
         ))
     ;; Pileline from likes producer to likers
     (future (pipeline #(get! likes-producer) #(put! q-likes %) #(close! q-likes) ) )

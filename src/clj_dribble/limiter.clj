@@ -7,15 +7,12 @@
 
 ;; Abstract protocol for managing limited resources
 (defprotocol Limiter
-  (acquire! 
-    "Acquire n permits. Locks if quantity of available limits is less then n."
-    [this, n] )
-  (acquire-all! 
-    "Acquire all available permits."
-    [this])
-  (reset-limit! 
-  "Reset permits counter."
-  [this])
+  ;; Acquire n permits. Locks if quantity of available limits is less then n.
+  (acquire! [this, n] )
+  ;; Acquire all available permits."
+  (acquire-all! [this])
+  ;; Reset permits counter."
+  (reset-limit! [this])
 )
 (defn acquire! [limiter] (acquire! limiter 1))
 
